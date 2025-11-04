@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Bicep Curl Counter</title>
+    <!-- Load Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles for the video/canvas container */
+        .camera-container {
+            position: relative;
+            width: 100%;
+            max-width: 640px;
+            margin: auto;
+            border: 4px solid #3b82f6; /* Blue border for visual feedback */
+            border-radius: 1rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+        video, canvas {
+            display: block;
+            width: 100%;
+            height: auto;
+            border-radius: 0.75rem; /* Rounded corners for media elements */
+        }
+        /* Ensure the canvas overlays the video exactly */
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 10;
+        }
+    </style>
+    <!-- Load MediaPipe Pose and Drawing Utilities -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils@0.6/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.js" crossorigin="anonymous"></script>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8 font-sans">
+
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-4xl font-extrabold text-gray-800 text-center mb-2">
+            AI Bicep Curl Counter
+        </h1>
+        <p class="text-center text-gray-500 mb-6">
+            Use your right arm for tracking. Ensure your full body is visible.
+        </p>
+
+        <!-- Main Status and Count Display -->
+        <div class="flex flex-col sm:flex-row justify-center items-center gap-4 mb-6">
+            <div id="rep-counter" class="bg-blue-600 text-white p-4 rounded-xl text-3xl font-bold w-full sm:w-48 text-center shadow-lg">
+                REPS: 0
+            </div>
+            <div id="status-display" class="bg-yellow-200 text-yellow-800 p-4 rounded-xl text-xl font-semibold w-full sm:w-80 text-center shadow-lg transition duration-300">
+                Awaiting Pose...
+            </div>
+        </div>
+
+        <!-- Camera and Canvas Container -->
+        <div class="camera-container">
+            <video id="video-feed" class="w-full" autoplay playsinline></video>
+            <canvas id="output-canvas" class="w-full"></canvas>
+            <div id="loading-message" class="absolute inset-0 bg-gray-900 bg-opacity-70 text-white flex items-center justify-center rounded-xl text-xl font-semibold z-20">
+                Loading AI Model...
+            </div>
+        </div>
+        
+        <!-- Instructions -->
+        <div class="mt-6 p-4 bg-white rounded-xl shadow-md">
+            <h3 class="text-xl font-bold text-gray-700 mb-3">Detection Logic</h3>
+            <ul class="list-disc list-inside text-gray-600 space-y-1">
+                <li>**Full Extension (Down):** Elbow angle must be $\ge 130^\circ$ (for rep credit).</li>
+                <li>**Peak Curl (Up):** Elbow angle must be $\le 70^\circ$ (to enable rep credit).</li>
+                <li>**Tip:** Start with arms fully straight (or nearly straight), curl up, and return to the extended position.</li>
+            </ul>
+            <p class="text-sm text-red-500 mt-3" id="error-message">
+                <!-- Error messages go here -->
+            </p>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('video-feed');
+        const canvasElement = document.getElementById('output-canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const repCounter = document.getElementById('rep-counter');
+        const statusDisplay = document.getElementById('status-display');
+        const loadingMessage = document.getElementById('loading-message');
+        const errorMessage = document.getElementById('error-message');
+
+        // --- Rep Counting Configuration ---
+        // CHANGED: Degrees for full extension (Down) is now 130
+        const BOTTOM_THRESHOLD = 130; 
+        const TOP_THRESHOLD = 70;     // Degrees for peak curl (Up)
+
+        // --- State Variables ---
+        let repCount = 0;
+        let isDownPosition = true; // True if arm is fully extended and waiting for a curl up
+
+        // Function to calculate the angle between three points (landmarks)
+        function calculateAngle(a, b, c) {
+            // Get coordinates from normalized MediaPipe landmarks (x, y)
+            const xA = a.x;
+            const yA = a.y;
+            const xB = b.x;
+            const yB = b.y;
+            const xC = c.x;
+            const yC = c.y;
+
+            // Vector math to find the angle
+            let angle = Math.atan2(yC - yB, xC - xB) - Math.atan2(yA - yB, xA - xB);
+            angle = Math.abs(angle * (180 / Math.PI)); // Convert to degrees and take absolute value
+
+            if (angle > 180.0) {
+                angle = 360 - angle;
+            }
+            return Math.round(angle);
+        }
+
+        // Main logic to process pose results and count reps
+        function onResults(results) {
+            // Draw the landmarks on the canvas
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            // Flip the video feed horizontally for a mirror effect
+            canvasCtx.translate(canvasElement.width, 0);
+            canvasCtx.scale(-1, 1);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+            
+            if (results.poseLandmarks) {
+                drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS,
+                               {color: '#00FF00', lineWidth: 4});
+                drawLandmarks(canvasCtx, results.poseLandmarks,
+                              {color: '#FF0000', lineWidth: 2});
+
+                // --- Bicep Curl Counting Logic ---
+                try {
+                    // We will track the RIGHT ARM: 
+                    // Shoulder (12), Elbow (14), Wrist (16)
+                    const shoulder = results.poseLandmarks[12];
+                    const elbow = results.poseLandmarks[14];
+                    const wrist = results.poseLandmarks[16];
+
+                    // Check if landmarks are visible (confidence check)
+                    if (shoulder.visibility > 0.8 && elbow.visibility > 0.8 && wrist.visibility > 0.8) {
+                        const elbowAngle = calculateAngle(shoulder, elbow, wrist);
+                        
+                        // Display the current angle for debugging/user feedback
+                        statusDisplay.textContent = `Angle: ${elbowAngle}° | Status: ${isDownPosition ? 'DOWN' : 'UP'}`;
+                        statusDisplay.classList.remove('bg-red-200', 'bg-green-200');
+                        statusDisplay.classList.add(isDownPosition ? 'bg-yellow-200' : 'bg-green-200');
+                        statusDisplay.classList.remove('text-red-800', 'text-green-800');
+                        statusDisplay.classList.add(isDownPosition ? 'text-yellow-800' : 'text-green-800');
+
+                        // 1. Check for the UPWARD movement (Curl Peak)
+                        if (elbowAngle < TOP_THRESHOLD) {
+                            if (isDownPosition) {
+                                // Transition to UP state
+                                isDownPosition = false;
+                            }
+                        }
+                        
+                        // 2. Check for the DOWNWARD movement (Full Extension)
+                        else if (elbowAngle > BOTTOM_THRESHOLD) {
+                            if (!isDownPosition) {
+                                // Transition back to DOWN state AND count the rep
+                                repCount++;
+                                isDownPosition = true;
+                                repCounter.textContent = `REPS: ${repCount}`;
+                                statusDisplay.classList.add('bg-green-200', 'text-green-800');
+                                
+                                // Simple visual confirmation (flash the counter)
+                                repCounter.style.transform = 'scale(1.1)';
+                                setTimeout(() => {
+                                    repCounter.style.transform = 'scale(1.0)';
+                                }, 100);
+                            }
+                        }
+                    } else {
+                        statusDisplay.textContent = "Adjust Position (Arm Not Visible)";
+                        statusDisplay.classList.add('bg-red-200', 'text-red-800');
+                    }
+
+                } catch (e) {
+                    console.error("Error during angle calculation:", e);
+                    statusDisplay.textContent = "Error: Cannot calculate angle.";
+                }
+
+            } else {
+                 statusDisplay.textContent = "Awaiting Pose...";
+            }
+            
+            canvasCtx.restore();
+        }
+
+        // Initialize MediaPipe Pose
+        const pose = new Pose({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${file}`;
+        }});
+
+        // Configure the model
+        pose.setOptions({
+            modelComplexity: 1, // Use complexity 1 for balance of speed and accuracy
+            smoothLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        // Set the callback function for results
+        pose.onResults(onResults);
+
+        // --- Camera Setup ---
+        async function setupCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        facingMode: 'user' // Prefer front camera (mirror mode)
+                    } 
+                });
+                videoElement.srcObject = stream;
+                
+                // Set canvas and video dimensions once the video metadata is loaded
+                videoElement.onloadedmetadata = () => {
+                    const videoWidth = videoElement.videoWidth;
+                    const videoHeight = videoElement.videoHeight;
+                    canvasElement.width = videoWidth;
+                    canvasElement.height = videoHeight;
+                    videoElement.play();
+                    
+                    // Start MediaPipe processing loop
+                    const camera = new Camera(videoElement, {
+                        onFrame: async () => {
+                            await pose.send({image: videoElement});
+                        },
+                        width: videoWidth,
+                        height: videoHeight
+                    });
+                    camera.start();
+                    loadingMessage.classList.add('hidden');
+                };
+
+            } catch (err) {
+                console.error("Error accessing camera:", err);
+                loadingMessage.classList.add('hidden');
+                errorMessage.textContent = 'Error: Could not access your camera. Please ensure it is connected and permissions are granted.';
+                errorMessage.classList.remove('hidden');
+            }
+        }
+
+        window.onload = setupCamera;
+
+    </script>
+</body>
+</html>
